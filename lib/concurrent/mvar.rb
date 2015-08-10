@@ -1,4 +1,5 @@
 require 'concurrent/concern/dereferenceable'
+require 'concurrent/synchronization'
 
 module Concurrent
 
@@ -34,8 +35,7 @@ module Concurrent
   # 2. S. Peyton Jones, A. Gordon, and S. Finne. [Concurrent Haskell](http://dl.acm.org/citation.cfm?id=237794).
   #    In Proceedings of the 23rd Symposium on Principles of Programming Languages
   #    (PoPL), 1996.
-  class MVar
-
+  class MVar < Synchronization::Object
     include Concern::Dereferenceable
 
     # Unique value that represents that an `MVar` was empty
@@ -51,11 +51,8 @@ module Concurrent
     #
     # @!macro deref_options
     def initialize(value = EMPTY, opts = {})
-      @value = value
-      @mutex = Mutex.new
-      @empty_condition = ConditionVariable.new
-      @full_condition = ConditionVariable.new
-      set_deref_options(opts)
+      super()
+      synchronize { ns_initialize(value, opts) }
     end
 
     # Remove the value from an `MVar`, leaving it empty, and blocking if there
@@ -63,14 +60,14 @@ module Concurrent
     # which case it returns `TIMEOUT` if the time is exceeded.
     # @return [Object] the value that was taken, or `TIMEOUT`
     def take(timeout = nil)
-      @mutex.synchronize do
+      synchronize do
         wait_for_full(timeout)
 
         # If we timed out we'll still be empty
-        if unlocked_full?
+        if ns_full?
           value = @value
           @value = EMPTY
-          @empty_condition.signal
+          @empty_condition.ns_signal
           apply_deref_options(value)
         else
           TIMEOUT
@@ -83,13 +80,13 @@ module Concurrent
     # which case it returns `TIMEOUT` if the time is exceeded.
     # @return [Object] the value that was put, or `TIMEOUT`
     def put(value, timeout = nil)
-      @mutex.synchronize do
+      synchronize do
         wait_for_empty(timeout)
 
         # If we timed out we won't be empty
-        if unlocked_empty?
+        if ns_empty?
           @value = value
-          @full_condition.signal
+          @full_condition.ns_signal
           apply_deref_options(value)
         else
           TIMEOUT
@@ -105,14 +102,14 @@ module Concurrent
     def modify(timeout = nil)
       raise ArgumentError.new('no block given') unless block_given?
 
-      @mutex.synchronize do
+      synchronize do
         wait_for_full(timeout)
 
         # If we timed out we'll still be empty
-        if unlocked_full?
+        if ns_full?
           value = @value
           @value = yield value
-          @full_condition.signal
+          @full_condition.ns_signal
           apply_deref_options(value)
         else
           TIMEOUT
@@ -122,11 +119,11 @@ module Concurrent
 
     # Non-blocking version of `take`, that returns `EMPTY` instead of blocking.
     def try_take!
-      @mutex.synchronize do
-        if unlocked_full?
+      synchronize do
+        if ns_full?
           value = @value
           @value = EMPTY
-          @empty_condition.signal
+          @empty_condition.ns_signal
           apply_deref_options(value)
         else
           EMPTY
@@ -136,10 +133,10 @@ module Concurrent
 
     # Non-blocking version of `put`, that returns whether or not it was successful.
     def try_put!(value)
-      @mutex.synchronize do
-        if unlocked_empty?
+      synchronize do
+        if ns_empty?
           @value = value
-          @full_condition.signal
+          @full_condition.ns_signal
           true
         else
           false
@@ -149,10 +146,10 @@ module Concurrent
 
     # Non-blocking version of `put` that will overwrite an existing value.
     def set!(value)
-      @mutex.synchronize do
+      synchronize do
         old_value = @value
         @value = value
-        @full_condition.signal
+        @full_condition.ns_signal
         apply_deref_options(old_value)
       end
     end
@@ -161,13 +158,13 @@ module Concurrent
     def modify!
       raise ArgumentError.new('no block given') unless block_given?
 
-      @mutex.synchronize do
+      synchronize do
         value = @value
         @value = yield value
-        if unlocked_empty?
-          @empty_condition.signal
+        if ns_empty?
+          @empty_condition.ns_signal
         else
-          @full_condition.signal
+          @full_condition.ns_signal
         end
         apply_deref_options(value)
       end
@@ -175,7 +172,7 @@ module Concurrent
 
     # Returns if the `MVar` is currently empty.
     def empty?
-      @mutex.synchronize { @value == EMPTY }
+      synchronize { @value == EMPTY }
     end
 
     # Returns if the `MVar` currently contains a value.
@@ -185,31 +182,39 @@ module Concurrent
 
     private
 
-    def unlocked_empty?
+    def ns_initialize(value, opts)
+      @value = value
+      @empty_condition = new_condition
+      @full_condition = new_condition
+      init_mutex(self)
+      set_deref_options(opts)
+    end
+
+    def ns_empty?
       @value == EMPTY
     end
 
-    def unlocked_full?
-      ! unlocked_empty?
+    def ns_full?
+      ! ns_empty?
     end
 
     def wait_for_full(timeout)
-      wait_while(@full_condition, timeout) { unlocked_empty? }
+      wait_while(@full_condition, timeout) { ns_empty? }
     end
 
     def wait_for_empty(timeout)
-      wait_while(@empty_condition, timeout) { unlocked_full? }
+      wait_while(@empty_condition, timeout) { ns_full? }
     end
 
     def wait_while(condition, timeout)
       if timeout.nil?
         while yield
-          condition.wait(@mutex)
+          condition.ns_wait
         end
       else
         stop = Concurrent.monotonic_time + timeout
         while yield && timeout > 0.0
-          condition.wait(@mutex, timeout)
+          condition.ns_wait(timeout)
           timeout = stop - Concurrent.monotonic_time
         end
       end
